@@ -95,19 +95,43 @@ function Find-ChestCalibration($Buttons, [string]$WindowKey) {
         SettingsHeight = $other.Height
     }
 }
+function Get-ChestCandidates($Calibration, $Buttons) {
+    if ($null -eq $Calibration) { return }
+    foreach ($button in $Buttons) {
+        if ($button.Key -ne $Calibration.SettingsKey -and
+            (Test-DesktopButton $button) -and (Test-SameSize $button $Calibration)) {
+            Write-Output $button
+        }
+    }
+}
 function Test-ChestCalibration($Calibration, $Buttons, [string]$WindowKey) {
     if ($null -eq $Calibration -or $Calibration.WindowKey -ne $WindowKey) { return $false }
-    if ($Buttons.Count -lt 1 -or $Buttons.Count -gt 3) { return $false }
-    if (@($Buttons | Where-Object { -not (Test-DesktopButton $_) }).Count -gt 0) { return $false }
     $settings = @($Buttons | Where-Object { $_.Key -eq $Calibration.SettingsKey })
-    if ($settings.Count -ne 1) { return $false }
+    if ($settings.Count -ne 1 -or -not (Test-DesktopButton $settings[0])) { return $false }
     $expected = [pscustomobject]@{ Width = $Calibration.SettingsWidth; Height = $Calibration.SettingsHeight }
     if (-not (Test-SameSize $settings[0] $expected)) { return $false }
-    foreach ($button in $Buttons) {
-        if ($button.Key -eq $Calibration.SettingsKey) { continue }
-        if (-not (Test-SameSize $button $Calibration)) { return $false }
-    }
+    # Extra emote/panel controls do not invalidate a learned chest size.
+    # The stable settings control detects window replacement and scale changes.
     return $true
+}
+
+function Update-MenuPause($State, $Pending, [bool]$ShouldPause, [datetime]$Now) {
+    if ($ShouldPause) {
+        if ($null -eq $State.StartedAt) {
+            $State.StartedAt = $Now
+            Write-Log '目前無法唯一辨識寶箱，暫停點擊；條件恢復後會自動繼續。'
+        }
+        return $true
+    }
+    if ($null -ne $State.StartedAt) {
+        if ($null -ne $Pending) {
+            # Menu time must not count toward the pending-click timeout.
+            $Pending.SentAt = $Pending.SentAt + ($Now - $State.StartedAt)
+        }
+        $State.StartedAt = $null
+        Write-Log '辨識條件已恢復，繼續檢查。'
+    }
+    return $false
 }
 
 $mutex = $null
@@ -122,19 +146,18 @@ try {
     }
     Write-Log ('模式：' + $(if ($Auto) { '自動領取；由原程式正常處理開箱與扣點。' } else { '只檢查，不點擊。' }))
     Write-Log '首次辨識會等待三顆按鈕：兩顆同尺寸寶箱，加上一顆不同尺寸的設定按鈕。'
-    Write-Log '請關閉背包／設定等面板，保持桌寵可見；等兩個寶箱都可領取，先不要手動領取。'
+    Write-Log '首次辨識請先關閉表情／其他面板，保持桌寵可見；等兩個寶箱都可領取。'
+    Write-Log '辨識完成後可以開啟表情選單；不同尺寸的表情按鈕會被忽略。'
     Write-Log '尺寸只記在這次執行中；移動位置不影響，偵測到縮放或介面變化會重新辨識。'
     if ($Auto) { Write-Log '每 5 秒檢查；Ctrl+C 或關閉這個 CMD 可停止。請勿同時執行舊版 API 自動領取。' }
     $pending = $null
     $calibration = $null
     $lastState = ''
+    $menuPause = @{ StartedAt = $null }
     while ($true) {
         $window = Get-GameWindow
         $windowKey = '{0}:{1}' -f $window.Current.ProcessId, $window.Current.NativeWindowHandle
         $buttons = @(Get-Buttons $window | ForEach-Object { Get-ButtonSnapshot $_ })
-        if ($buttons.Count -gt 3) {
-            throw '偵測到額外按鈕，已停止；請關閉背包、設定等面板，再重新啟動。'
-        }
         if ($null -ne $calibration -and -not (Test-ChestCalibration $calibration $buttons $windowKey)) {
             Write-Log '尺寸、設定按鈕或視窗狀態已改變，清除舊尺寸，等待兩個寶箱重新辨識。'
             $calibration = $null
@@ -145,12 +168,12 @@ try {
                 Write-Log ('已自動辨識寶箱尺寸：{0} x {1}。' -f $calibration.Width, $calibration.Height)
             }
         }
-        $candidates = @()
-        if ($null -ne $calibration) {
-            $candidates = @($buttons | Where-Object {
-                $_.Key -ne $calibration.SettingsKey -and
-                (Test-DesktopButton $_) -and (Test-SameSize $_ $calibration)
-            })
+        $candidates = @(Get-ChestCandidates $calibration $buttons)
+        $shouldPause = ($null -eq $calibration -and $buttons.Count -gt 3) -or $candidates.Count -gt 2
+        if (Update-MenuPause $menuPause $pending $shouldPause (Get-Date)) {
+            if (-not $Auto) { break }
+            Start-Sleep -Seconds 5
+            continue
         }
         $state = if ($null -eq $calibration) {
             '按鈕 {0} 顆；等待三顆可見按鈕中恰有兩顆同尺寸，暫不點擊。' -f $buttons.Count

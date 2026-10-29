@@ -6,13 +6,14 @@ $tokens = $null
 $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count -gt 0) { throw ($parseErrors | Out-String) }
-$names = @('Test-SameSize', 'Test-DesktopButton', 'Find-ChestCalibration', 'Test-ChestCalibration')
+$names = @('Test-SameSize', 'Test-DesktopButton', 'Find-ChestCalibration', 'Test-ChestCalibration', 'Get-ChestCandidates', 'Update-MenuPause')
 foreach ($name in $names) {
     $node = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
         Where-Object { $_.Name -eq $name }
     if (@($node).Count -ne 1) { throw "Function not found: $name" }
     . ([scriptblock]::Create($node.Extent.Text))
 }
+function Write-Log([string]$Message) { }
 $script:checks = 0
 function Assert-True($Value, [string]$Label) {
     if (-not $Value) { throw "FAIL: $Label" }
@@ -44,7 +45,7 @@ Assert-True ($null -eq (Find-ChestCalibration @($a,$b,$s,(Button 'extra' 20 20))
 Assert-True (-not (Test-ChestCalibration $c @($a,$b,$s) 'window2')) 'new window requires learning'
 Assert-True (-not (Test-ChestCalibration $c @($a,$b,(Button 'new-settings' 38 32)) 'window1')) 'changed settings identity requires learning'
 Assert-True (-not (Test-ChestCalibration $c @((Button 'settings' 48 40)) 'window1')) 'scale change detected during countdown'
-Assert-True (-not (Test-ChestCalibration $c @((Button 'left' 90 60),$s) 'window1')) 'lone resized chest invalidates old dimensions'
+Assert-True (@(Get-ChestCandidates $c @((Button 'left' 90 60),$s)).Count -eq 0) 'unknown dimensions never selected'
 $scaled = @((Button 'left' 93 66),(Button 'right' 93 66),(Button 'settings' 57 48))
 $sc = Find-ChestCalibration $scaled 'window1'
 Assert-True ($null -ne $sc -and $sc.Width -eq 93 -and $sc.Height -eq 66) 'different scale learns automatically'
@@ -58,4 +59,38 @@ Assert-True ($null -eq (Find-ChestCalibration @($a,$named,$s) 'window1')) 'named
 Assert-True ($null -eq (Find-ChestCalibration @($a,$a,$s) 'window1')) 'duplicate elements cannot initialize'
 Assert-True ($null -eq (Find-ChestCalibration @((Button 'left' ([double]::NaN) 44),$b,$s) 'window1')) 'invalid rectangle cannot initialize'
 Assert-True (-not (Test-ChestCalibration $c @() 'window1')) 'hidden window invalidates calibration'
+# Opening an emote menu must pause without clearing learned size or pending action.
+$pause = @{ StartedAt = $null }
+$sent = [datetime]'2026-10-29T08:00:00'
+$pending = @{ Key = 'left'; SentAt = $sent }
+$start = $sent.AddSeconds(20)
+Assert-True (Update-MenuPause $pause $pending $true $start) 'ambiguous matches pause scan'
+Assert-True ($pause.StartedAt -eq $start -and $pending.Key -eq 'left') 'pause preserves pending identity'
+Assert-True (Update-MenuPause $pause $pending $true $start.AddSeconds(60)) 'menu remains paused'
+Assert-True ($pause.StartedAt -eq $start) 'pause timestamp not reset every scan'
+Assert-True (-not (Update-MenuPause $pause $pending $false $start.AddSeconds(180))) 'closing menu resumes with one chest'
+Assert-True ($null -eq $pause.StartedAt) 'resume clears pause state'
+Assert-True ($pending.SentAt -eq $sent.AddSeconds(180)) 'menu time excluded from 90 second timeout'
+Assert-True (-not (Update-MenuPause $pause $pending $false $start.AddSeconds(185))) 'next scan continues normally'
+Assert-True ($pending.SentAt -eq $sent.AddSeconds(180)) 'pending timer adjusted exactly once'
+Assert-True (Test-ChestCalibration $c @($b,$s) 'window1') 'learned dimensions survive menu pause'
+$noPending = @{ StartedAt = $null }
+Assert-True (Update-MenuPause $noPending $null $true $start) 'pause before calibration or any click'
+Assert-True (-not (Update-MenuPause $noPending $null $false $start.AddSeconds(10))) 'resume without pending click'
+# Learned chests remain recognizable alongside five emote controls.
+$emotes = @(1..5 | ForEach-Object { Button ('emote' + $_) 32 32 })
+$withMenu = @($a,$b,$s) + $emotes
+Assert-True (Test-ChestCalibration $c $withMenu 'window1') 'five emotes preserve calibration'
+$matches = @(Get-ChestCandidates $c $withMenu)
+Assert-True ($matches.Count -eq 2 -and $matches.Key -contains 'left' -and $matches.Key -contains 'right') 'only chests selected with menu open'
+Assert-True (@(Get-ChestCandidates $c (@($b,$s)+$emotes)).Count -eq 1) 'single chest selected with menu open'
+Assert-True (@(Get-ChestCandidates $c (@($s)+$emotes)).Count -eq 0) 'emotes not selected during countdown'
+Assert-True ($null -eq (Find-ChestCalibration $withMenu 'window1')) 'initial learning waits for menu to close'
+$namedExtra = Button 'named' 62 44; $namedExtra.Name = 'Emote'
+Assert-True (@(Get-ChestCandidates $c (@($a,$b,$s,$namedExtra)+$emotes)).Count -eq 2) 'named matching-size control excluded'
+$ambiguous = @(Get-ChestCandidates $c (@($a,$b,$s,(Button 'same-size-emote' 62 44))+$emotes))
+Assert-True ($ambiguous.Count -gt 2) 'indistinguishable matching-size control triggers ambiguity guard'
+$state = @{ StartedAt = $null }
+Assert-True (-not (Update-MenuPause $state $null ($matches.Count -gt 2) $start)) 'five distinct emotes do not pause learned detection'
+Assert-True (Update-MenuPause $state $null ($ambiguous.Count -gt 2) $start) 'ambiguous extras pause instead of invoking'
 Write-Output ("PASS: {0} detection checks; script syntax valid." -f $script:checks)
