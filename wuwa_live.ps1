@@ -180,6 +180,10 @@ try {
             Start-Sleep -Seconds 5
             continue
         }
+        if ($lastState -in @('foreground', 'ambiguous', 'relearn')) {
+            Write-Log '已恢復自動領取，繼續每 5 秒檢查寶箱。'
+        }
+        $lastState = 'monitoring'
         $ready = @($candidates | Where-Object { $_.Enabled })
         if ($ready.Count -eq 0) {
             if (-not $Auto) { throw '目前沒有可用寶箱；沒有送出訊息。' }
