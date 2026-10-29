@@ -1,12 +1,7 @@
-﻿# Wuwa Tappo simultaneous UI Automation helper, Windows PowerShell 5.1.
-# Default: inspect only. -Auto: invoke recognized chest buttons.
-# Does not read credentials, call game APIs, move the mouse, or change files.
+﻿# Wuwa Tappo automatic background chest collection v1.1
 [CmdletBinding()]
-param(
-    [switch]$Auto
-)
+param([switch]$Auto)
 $ErrorActionPreference = 'Stop'
-
 function Write-Log([string]$Message) {
     Write-Host ('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $Message)
 }
@@ -82,7 +77,6 @@ function Find-ChestCalibration($Buttons, [string]$WindowKey) {
     if ($pairs.Count -ne 1) { return $null }
     $a = $Buttons[$pairs[0].First]
     $b = $Buttons[$pairs[0].Second]
-    if (-not $a.Invoke -or -not $b.Invoke) { return $null }
     $otherIndex = 3 - $pairs[0].First - $pairs[0].Second
     $other = $Buttons[$otherIndex]
     # Keep both learned measurements: a lone settings button can detect scaling changes.
@@ -134,100 +128,115 @@ function Update-MenuPause($State, $Pending, [bool]$ShouldPause, [datetime]$Now) 
     return $false
 }
 
+
 $mutex = $null
-$hasMutex = $false
+$ownsMutex = $false
+$guard = $null
+$probe = $null
 try {
     Add-Type -AssemblyName UIAutomationClient
     Add-Type -AssemblyName UIAutomationTypes
-    if ($Auto) {
-        $mutex = New-Object System.Threading.Mutex($false, 'Local\WuwaTappoUIAAutoChestV1')
-        $hasMutex = $mutex.WaitOne(0)
-        if (-not $hasMutex) { throw '已有一個同時執行版正在運作，請先關閉另一個。' }
-    }
-    Write-Log ('模式：' + $(if ($Auto) { '自動領取；由原程式正常處理開箱與扣點。' } else { '只檢查，不點擊。' }))
-    Write-Log '首次辨識會等待三顆按鈕：兩顆同尺寸寶箱，加上一顆不同尺寸的設定按鈕。'
-    Write-Log '首次辨識請先關閉表情／其他面板，保持桌寵可見；等兩個寶箱都可領取。'
-    Write-Log '辨識完成後可以開啟表情選單；不同尺寸的表情按鈕會被忽略。'
-    Write-Log '尺寸只記在這次執行中；移動位置不影響，偵測到縮放或介面變化會重新辨識。'
-    if ($Auto) { Write-Log '每 5 秒檢查；Ctrl+C 或關閉這個 CMD 可停止。請勿同時執行舊版 API 自動領取。' }
-    $pending = $null
+    Add-Type -Path (Join-Path $PSScriptRoot 'NativeBackground.cs')
+    $mutex = New-Object System.Threading.Mutex($false, 'Local\WuwaTappoUIAAutoChestV1')
+    $ownsMutex = $mutex.WaitOne(0)
+    if (-not $ownsMutex) { throw '已有自動領取腳本執行中，請先關閉。' }
+    Write-Log 'Wuwa Tappo v1.1 背景領取；每 5 秒檢查一次。'
+    Write-Log '先關閉表情／設定面板，等兩個寶箱都能領取。辨識後會給你 10 秒切回遊戲。'
     $calibration = $null
     $lastState = ''
-    $menuPause = @{ StartedAt = $null }
-    while ($true) {
+    while ($null -eq $calibration) {
         $window = Get-GameWindow
         $windowKey = '{0}:{1}' -f $window.Current.ProcessId, $window.Current.NativeWindowHandle
         $buttons = @(Get-Buttons $window | ForEach-Object { Get-ButtonSnapshot $_ })
-        if ($null -ne $calibration -and -not (Test-ChestCalibration $calibration $buttons $windowKey)) {
-            Write-Log '尺寸、設定按鈕或視窗狀態已改變，清除舊尺寸，等待兩個寶箱重新辨識。'
-            $calibration = $null
-        }
-        if ($null -eq $calibration) {
-            $calibration = Find-ChestCalibration $buttons $windowKey
-            if ($null -ne $calibration) {
-                Write-Log ('已自動辨識寶箱尺寸：{0} x {1}。' -f $calibration.Width, $calibration.Height)
+        $calibration = Find-ChestCalibration $buttons $windowKey
+        $state = '目前按鈕 {0} 顆；等待唯一的同尺寸寶箱配對。' -f $buttons.Count
+        if ($state -ne $lastState) { Write-Log $state; $lastState = $state }
+        if ($null -eq $calibration) { Start-Sleep -Seconds 5 }
+    }
+    Write-Log ('已辨識寶箱：{0} x {1}。現在有 10 秒可以切回遊戲。' -f $calibration.Width, $calibration.Height)
+    Start-Sleep -Seconds 10
+    $target = [IntPtr]$window.Current.NativeWindowHandle
+    while ($true) {
+        $window = Get-GameWindow
+        $key = '{0}:{1}' -f $window.Current.ProcessId, $window.Current.NativeWindowHandle
+        $buttons = @(Get-Buttons $window | ForEach-Object { Get-ButtonSnapshot $_ })
+        if (-not (Test-ChestCalibration $calibration $buttons $key)) {
+            $calibration = Find-ChestCalibration $buttons $key
+            if ($null -eq $calibration) {
+                if ($lastState -ne 'relearn') { Write-Log '等待重新辨識：請關閉表情／設定面板，等兩個寶箱都能領取。'; $lastState = 'relearn' }
+                Start-Sleep -Seconds 5
+                continue
             }
+            $target = [IntPtr]$window.Current.NativeWindowHandle
+            Write-Log '已重新辨識寶箱尺寸。'
         }
         $candidates = @(Get-ChestCandidates $calibration $buttons)
-        $shouldPause = ($null -eq $calibration -and $buttons.Count -gt 3) -or $candidates.Count -gt 2
-        if (Update-MenuPause $menuPause $pending $shouldPause (Get-Date)) {
-            if (-not $Auto) { break }
+        if ($candidates.Count -gt 2) {
+            if ($lastState -ne 'ambiguous') { Write-Log '符合尺寸的按鈕太多，暫停；條件恢復後自動繼續。'; $lastState = 'ambiguous' }
             Start-Sleep -Seconds 5
             continue
         }
-        $state = if ($null -eq $calibration) {
-            '按鈕 {0} 顆；等待三顆可見按鈕中恰有兩顆同尺寸，暫不點擊。' -f $buttons.Count
-        } else {
-            '按鈕 {0} 顆；符合寶箱尺寸 {1} 顆。' -f $buttons.Count, $candidates.Count
+        if ([WuwaBackgroundNative]::IsTargetForeground($target)) {
+            if ($lastState -ne 'foreground') { Write-Log '正在操作桌寵，暫停領取；切回其他視窗後自動繼續。'; $lastState = 'foreground' }
+            Start-Sleep -Seconds 5
+            continue
         }
-        if ($state -ne $lastState) { Write-Log $state; $lastState = $state }
-        if (-not $Auto) {
-            foreach ($button in $buttons) {
-                Write-Host ('尺寸={0}x{1} | 寶箱候選={2} | Enabled={3} | Invoke={4}' -f
-                    $button.Width, $button.Height,
-                    ($candidates.Key -contains $button.Key), $button.Enabled, $button.Invoke)
-            }
-            break
+        $ready = @($candidates | Where-Object { $_.Enabled })
+        if ($ready.Count -eq 0) {
+            if (-not $Auto) { throw '目前沒有可用寶箱；沒有送出訊息。' }
+            Start-Sleep -Seconds 5
+            continue
         }
-        if ($null -ne $pending) {
-            $stillPresent = @($buttons | Where-Object { $_.Key -eq $pending.Key })
-            if ($stillPresent.Count -eq 0) {
-                Write-Log '剛才的寶箱按鈕已消失；繼續等待下一顆。'
-                $pending = $null
-            } elseif (((Get-Date) - $pending.SentAt).TotalSeconds -gt 90) {
-                throw '點擊後 90 秒內按鈕仍未消失，已停止且不重複點擊。請查看是否點擊數不足或有錯誤提示。'
-            }
+        $lastState = 'ready'
+        $button = $ready[0]
+        $fresh = Get-ButtonSnapshot $button.Element
+        if ($fresh.Key -ne $button.Key -or -not $fresh.Enabled -or
+            -not (Test-DesktopButton $fresh) -or -not (Test-SameSize $fresh $calibration)) {
+            throw '寶箱狀態剛好改變，沒有送出訊息，請再試一次。'
         }
-        if ($null -eq $pending) {
-            # Re-find controls each cycle; never retain screen coordinates.
-            foreach ($button in $candidates) {
-                $element = $button.Element
-                $c = $element.Current
-                if (-not $c.IsEnabled -or $c.IsOffscreen) { continue }
-                # Revalidate size and identity immediately before invoking.
-                $fresh = Get-ButtonSnapshot $element
-                if ($fresh.Key -ne $button.Key -or -not (Test-DesktopButton $fresh) -or
-                    -not (Test-SameSize $fresh $calibration)) { continue }
-                $invokeObject = $null
-                if (-not $element.TryGetCurrentPattern(
-                    [System.Windows.Automation.InvokePattern]::Pattern, [ref]$invokeObject)) {
-                    throw '寶箱按鈕不支援 Invoke 操作；未點擊，也不會改用滑鼠亂點。'
-                }
-                $key = $fresh.Key
-                # Mark pending before dispatch: any exception stops without retries.
-                $pending = @{ Key = $key; SentAt = Get-Date }
-                Write-Log '已找到可操作的寶箱，送出一次原程式按鈕操作。'
-                ([System.Windows.Automation.InvokePattern]$invokeObject).Invoke()
-                break
-            }
+        $r = $button.Element.Current.BoundingRectangle
+        $x = [int][Math]::Floor($r.Left + $r.Width / 2)
+        $y = [int][Math]::Floor($r.Top + $r.Height / 2)
+        $guard = New-Object WuwaBackgroundNative+WindowGuard($target)
+        $probe = New-Object WuwaBackgroundNative+FocusProbe($target)
+        Write-Log '背景領取寶箱。'
+        $description = [WuwaBackgroundNative]::ClickWebView($target, $x, $y)
+        Write-Log ('送出成功：' + $description + '（送出不等於已領取）')
+        $gone = $false
+        $until = (Get-Date).AddSeconds(10)
+        while ((Get-Date) -lt $until) {
+            Start-Sleep -Milliseconds 250
+            $guard.Verify()
+            if ($probe.TargetSeen) { break }
+            $current = @(Get-Buttons $window)
+            $remaining = @($current | Where-Object { (Get-ElementKey $_) -eq $button.Key })
+            if ($remaining.Count -eq 0) { $gone = $true; break }
         }
+        # Observe a little longer for delayed focus changes from reward animation.
+        Start-Sleep -Seconds 2
+        $probe.Dispose()
+        $stolen = $probe.TargetSeen
+        $changes = $probe.Changes
+        $probe = $null
+        $guard.Dispose()
+        $guard = $null
+        Write-Log ('領取觀察：寶箱按鈕消失={0}；監測到桌寵進入前景={1}；監測到前景變更次數={2}。' -f $gone, $stolen, $changes)
+        if ($stolen) { throw '觀察到桌寵進入前景，已停止。' }
+        if (-not $gone) { throw '10 秒內沒看到寶箱按鈕消失。此法可能不被 WebView 接受；不重送、不改用舊版點擊。' }
+        Write-Log '寶箱按鈕已消失，繼續等待下一次領取。'
+        if (-not $Auto) { break }
         Start-Sleep -Seconds 5
     }
 } catch {
     Write-Log ('已停止：' + $_.Exception.Message)
-    if ($Auto) { Write-Log '若剛送出按鈕操作，請查看程式是否已領取；腳本不會自動重試。' }
+    Write-Log '若已送出訊息，請查看原程式是否已領取；不要立即重複操作同一顆。'
     exit 1
 } finally {
-    if ($hasMutex -and $null -ne $mutex) { $mutex.ReleaseMutex() }
+    if ($null -ne $probe) { $probe.Dispose() }
+    if ($null -ne $guard) {
+        try { $guard.Dispose(); Write-Log '已還原本次更動的桌寵視窗樣式。' }
+        catch { Write-Log '視窗樣式還原失敗；請完整退出 Wuwa Tappo 再開啟。' }
+    }
+    if ($ownsMutex -and $null -ne $mutex) { $mutex.ReleaseMutex() }
     if ($null -ne $mutex) { $mutex.Dispose() }
 }

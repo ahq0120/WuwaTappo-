@@ -53,7 +53,7 @@ Assert-True (Test-ChestCalibration $sc @($scaled[0],$scaled[2]) 'window1') 'one 
 $hidden = Button 'right' 62 44; $hidden.Visible = $false
 Assert-True ($null -eq (Find-ChestCalibration @($a,$hidden,$s) 'window1')) 'hidden button cannot initialize'
 $unsupported = Button 'right' 62 44; $unsupported.Invoke = $false
-Assert-True ($null -eq (Find-ChestCalibration @($a,$unsupported,$s) 'window1')) 'unsupported chest cannot initialize'
+Assert-True ($null -ne (Find-ChestCalibration @($a,$unsupported,$s) 'window1')) 'background messages do not require Invoke support'
 $named = Button 'right' 62 44; $named.Name = 'Other action'
 Assert-True ($null -eq (Find-ChestCalibration @($a,$named,$s) 'window1')) 'named panel action cannot initialize'
 Assert-True ($null -eq (Find-ChestCalibration @($a,$a,$s) 'window1')) 'duplicate elements cannot initialize'
