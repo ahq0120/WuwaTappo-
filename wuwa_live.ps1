@@ -141,7 +141,7 @@ try {
     $ownsMutex = $mutex.WaitOne(0)
     if (-not $ownsMutex) { throw '已有自動領取腳本執行中，請先關閉。' }
     Write-Log 'Wuwa Tappo v1.1 背景領取；每 5 秒檢查一次。'
-    Write-Log '先關閉表情／設定面板，等兩個寶箱都能領取。辨識後會給你 10 秒切回遊戲。'
+    Write-Log '先關閉表情／設定面板，等兩個寶箱都能領取。辨識完成後會自動背景領取。'
     $calibration = $null
     $lastState = ''
     while ($null -eq $calibration) {
@@ -153,8 +153,7 @@ try {
         if ($state -ne $lastState) { Write-Log $state; $lastState = $state }
         if ($null -eq $calibration) { Start-Sleep -Seconds 5 }
     }
-    Write-Log ('已辨識寶箱：{0} x {1}。現在有 10 秒可以切回遊戲。' -f $calibration.Width, $calibration.Height)
-    Start-Sleep -Seconds 10
+    Write-Log ('已辨識寶箱：{0} x {1}。開始自動背景領取。' -f $calibration.Width, $calibration.Height)
     $target = [IntPtr]$window.Current.NativeWindowHandle
     while ($true) {
         $window = Get-GameWindow
