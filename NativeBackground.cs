@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -68,17 +70,36 @@ public static class WuwaBackgroundNative {
         readonly IntPtr target; readonly uint process; readonly IntPtr initial;
         readonly Thread worker; volatile bool running = true;
         int changes; int targetSeen;
+        volatile string phase = "before-guard";
+        readonly ConcurrentQueue<string> events = new ConcurrentQueue<string>();
+        public void Mark(string value) { phase = value; }
+        public string[] GetEvents() { return events.ToArray(); }
+        static string Describe(IntPtr window) {
+            uint pid = ProcessOf(window);
+            string name = "none";
+            if (pid != 0) {
+                try { using (var p = Process.GetProcessById((int)pid)) { name = p.ProcessName; } }
+                catch { name = "unavailable"; }
+            }
+            var cls = new StringBuilder(256);
+            GetClassName(window, cls, cls.Capacity);
+            return "hwnd=0x" + window.ToInt64().ToString("X") + "; pid=" + pid + "; process=" + name + "; class=" + cls;
+        }
+        void Record(IntPtr window) {
+            if (events.Count < 200) events.Enqueue(DateTime.Now.ToString("HH:mm:ss.fff") + " [" + phase + "] " + Describe(window));
+        }
         public int Changes { get { return Volatile.Read(ref changes); } }
         public bool TargetSeen { get { return Volatile.Read(ref targetSeen) != 0; } }
         public FocusProbe(IntPtr window) {
             target = window; process = ProcessOf(window); initial = GetForegroundWindow();
+            Record(initial);
             worker = new Thread(Watch); worker.IsBackground = true; worker.Start();
         }
         void Watch() {
             IntPtr previous = initial;
             while (running) {
                 IntPtr current = GetForegroundWindow();
-                if (current != previous) { Interlocked.Increment(ref changes); previous = current; }
+                if (current != previous) { Interlocked.Increment(ref changes); previous = current; Record(current); }
                 if (current != IntPtr.Zero && (GetAncestor(current, 2) == target || ProcessOf(current) == process)) Interlocked.Exchange(ref targetSeen, 1);
                 Thread.Sleep(5);
             }

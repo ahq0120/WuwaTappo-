@@ -1,6 +1,6 @@
-﻿# Wuwa Tappo automatic background chest collection v1.1
+﻿# Wuwa Tappo automatic background chest collection v1.1.1
 [CmdletBinding()]
-param([switch]$Auto)
+param([switch]$Auto, [ValidateSet('UpperFirst','LowerFirst')][string]$Order = 'UpperFirst')
 $ErrorActionPreference = 'Stop'
 function Write-Log([string]$Message) {
     Write-Host ('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $Message)
@@ -134,14 +134,20 @@ $ownsMutex = $false
 $guard = $null
 $probe = $null
 try {
+    Start-Transcript -Path (Join-Path $PSScriptRoot ('wuwa-live-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))) | Out-Null
     Add-Type -AssemblyName UIAutomationClient
     Add-Type -AssemblyName UIAutomationTypes
     Add-Type -Path (Join-Path $PSScriptRoot 'NativeBackground.cs')
     $mutex = New-Object System.Threading.Mutex($false, 'Local\WuwaTappoUIAAutoChestV1')
     $ownsMutex = $mutex.WaitOne(0)
     if (-not $ownsMutex) { throw '已有自動領取腳本執行中，請先關閉。' }
-    Write-Log 'Wuwa Tappo v1.1 背景領取；每 5 秒檢查一次。'
+    Write-Log ('Wuwa Tappo v1.1.1 背景領取；順序={0}；每 5 秒檢查。' -f $Order)
     Write-Log '先關閉表情／設定面板，等兩個寶箱都能領取。辨識完成後會自動背景領取。'
+    $attempt = 0
+    $batchClicks = 0
+    $nextChestKey = $null
+    $previousDispatchClock = $null
+    $positionLabels = @{}
     $calibration = $null
     $lastState = ''
     while ($null -eq $calibration) {
@@ -159,6 +165,11 @@ try {
         $window = Get-GameWindow
         $key = '{0}:{1}' -f $window.Current.ProcessId, $window.Current.NativeWindowHandle
         $buttons = @(Get-Buttons $window | ForEach-Object { Get-ButtonSnapshot $_ })
+        if ($null -ne $guard) {
+            $guard.Verify()
+            if ($probe.TargetSeen) { throw '兩顆之間觀察到桌寵進入前景，停止本輪。' }
+            if (-not (Test-ChestCalibration $calibration $buttons $key)) { throw '兩顆之間視窗或尺寸改變，停止本輪並還原。' }
+        }
         if (-not (Test-ChestCalibration $calibration $buttons $key)) {
             $calibration = Find-ChestCalibration $buttons $key
             if ($null -eq $calibration) {
@@ -170,6 +181,7 @@ try {
             Write-Log '已重新辨識寶箱尺寸。'
         }
         $candidates = @(Get-ChestCandidates $calibration $buttons)
+        if ($null -ne $guard -and ($candidates.Count -gt 2 -or [WuwaBackgroundNative]::IsTargetForeground($target))) { throw '兩顆之間辨識條件改變或桌寵進入前景，停止本輪並還原。' }
         if ($candidates.Count -gt 2) {
             if ($lastState -ne 'ambiguous') { Write-Log '符合尺寸的按鈕太多，暫停；條件恢復後自動繼續。'; $lastState = 'ambiguous' }
             Start-Sleep -Seconds 5
@@ -185,13 +197,24 @@ try {
         }
         $lastState = 'monitoring'
         $ready = @($candidates | Where-Object { $_.Enabled })
+        if ($null -ne $guard -and @($ready | Where-Object { $_.Key -eq $nextChestKey }).Count -ne 1) { throw '預定的下一顆寶箱已不可用，停止本輪並還原。' }
         if ($ready.Count -eq 0) {
             if (-not $Auto) { throw '目前沒有可用寶箱；沒有送出訊息。' }
             Start-Sleep -Seconds 5
             continue
         }
         $lastState = 'ready'
-        $button = $ready[0]
+        # Label both positions before either disappears; retain labels for the lone chest.
+        if ($candidates.Count -eq 2) {
+            $ordered = @($candidates | Sort-Object { $_.Element.Current.BoundingRectangle.Top })
+            $positionLabels[$ordered[0].Key] = '上方'
+            $positionLabels[$ordered[1].Key] = '下方'
+        }
+        $sortedReady = @($ready | Sort-Object { $_.Element.Current.BoundingRectangle.Top })
+        $button = $sortedReady[0]
+        if ($Order -eq 'LowerFirst') { $button = $sortedReady[-1] }
+        if ($null -ne $guard) { $button = @($ready | Where-Object { $_.Key -eq $nextChestKey })[0] }
+
         $fresh = Get-ButtonSnapshot $button.Element
         if ($fresh.Key -ne $button.Key -or -not $fresh.Enabled -or
             -not (Test-DesktopButton $fresh) -or -not (Test-SameSize $fresh $calibration)) {
@@ -200,9 +223,23 @@ try {
         $r = $button.Element.Current.BoundingRectangle
         $x = [int][Math]::Floor($r.Left + $r.Width / 2)
         $y = [int][Math]::Floor($r.Top + $r.Height / 2)
-        $guard = New-Object WuwaBackgroundNative+WindowGuard($target)
-        $probe = New-Object WuwaBackgroundNative+FocusProbe($target)
-        Write-Log '背景領取寶箱。'
+        # Begin observation before applying the style guard, and keep it through restoration.
+        if ($null -eq $guard) {
+            $probe = New-Object WuwaBackgroundNative+FocusProbe($target)
+            $probe.Mark('apply-guard')
+            $guard = New-Object WuwaBackgroundNative+WindowGuard($target)
+            $batchClicks = 0
+        } else {
+            $guard.Verify()
+            Write-Log ('距上一顆送出已過 {0:N1} 秒；防啟用樣式持續有效。' -f $previousDispatchClock.Elapsed.TotalSeconds)
+        }
+        $probe.Mark('dispatch')
+        $batchClicks++
+        $attempt++
+        $position = $positionLabels[$button.Key]
+        if (-not $position) { $position = '位置未知' }
+        Write-Log ('第 {0} 次送出；寶箱={1}；螢幕座標={2},{3}。' -f $attempt, $position, $x, $y)
+        $previousDispatchClock = [System.Diagnostics.Stopwatch]::StartNew()
         $description = [WuwaBackgroundNative]::ClickWebView($target, $x, $y)
         Write-Log ('送出成功：' + $description + '（送出不等於已領取）')
         $gone = $false
@@ -215,15 +252,47 @@ try {
             $remaining = @($current | Where-Object { (Get-ElementKey $_) -eq $button.Key })
             if ($remaining.Count -eq 0) { $gone = $true; break }
         }
-        # Observe a little longer for delayed focus changes from reward animation.
-        Start-Sleep -Seconds 2
+        # Keep the original short confirmation + polling delay, without restoring
+        # between the two confirmed, distinct chest controls.
+        if ($gone -and -not $probe.TargetSeen -and $Auto -and $batchClicks -eq 1) {
+            $currentSnapshots = @(Get-Buttons $window | ForEach-Object { Get-ButtonSnapshot $_ })
+            $remainingReady = @(Get-ChestCandidates $calibration $currentSnapshots | Where-Object { $_.Enabled -and $_.Key -ne $button.Key })
+            if ((Test-ChestCalibration $calibration $currentSnapshots $key) -and $remainingReady.Count -eq 1) {
+                $nextChestKey = $remainingReady[0].Key
+                Write-Log ('第 {0} 次：按鈕已消失；保留防啟用樣式，約 7 秒後重新確認並領下一顆。' -f $attempt)
+                $probe.Mark('between-chests-guarded')
+                $betweenUntil = (Get-Date).AddSeconds(7)
+                while ((Get-Date) -lt $betweenUntil) {
+                    $guard.Verify()
+                    if ($probe.TargetSeen) { throw '兩顆之間觀察到桌寵進入前景，已停止。' }
+                    Start-Sleep -Milliseconds 250
+                }
+                continue
+            }
+        }
+        $nextChestKey = $null
+        $probe.Mark('guarded-wait')
+        Write-Log '本輪操作結束，保留防啟用樣式 15 秒後再還原。'
+        $holdUntil = (Get-Date).AddSeconds(15)
+        while ((Get-Date) -lt $holdUntil) {
+            $guard.Verify()
+            Start-Sleep -Milliseconds 250
+        }
+        $beforeRestoreSeen = $probe.TargetSeen
+        $beforeRestoreChanges = $probe.Changes
+        Write-Log ('還原前：桌寵進入前景={0}；前景變更={1}。' -f $beforeRestoreSeen, $beforeRestoreChanges)
+        $probe.Mark('restore-style')
+        $guard.Dispose()
+        $guard = $null
+        $probe.Mark('after-restore')
+        Write-Log '視窗樣式已還原；繼續監測 5 秒。'
+        Start-Sleep -Seconds 5
         $probe.Dispose()
         $stolen = $probe.TargetSeen
         $changes = $probe.Changes
+        foreach ($entry in $probe.GetEvents()) { Write-Log ('焦點軌跡：' + $entry) }
         $probe = $null
-        $guard.Dispose()
-        $guard = $null
-        Write-Log ('領取觀察：寶箱按鈕消失={0}；監測到桌寵進入前景={1}；監測到前景變更次數={2}。' -f $gone, $stolen, $changes)
+        Write-Log ('第 {0} 次結果；寶箱={1}；按鈕消失={2}；桌寵進入前景={3}；前景變更={4}；還原後新增變更={5}。' -f $attempt, $position, $gone, $stolen, $changes, ($changes - $beforeRestoreChanges))
         if ($stolen) { throw '觀察到桌寵進入前景，已停止。' }
         if (-not $gone) { throw '10 秒內沒看到寶箱按鈕消失。此法可能不被 WebView 接受；不重送、不改用舊版點擊。' }
         Write-Log '寶箱按鈕已消失，繼續等待下一次領取。'
@@ -235,11 +304,15 @@ try {
     Write-Log '若已送出訊息，請查看原程式是否已領取；不要立即重複操作同一顆。'
     exit 1
 } finally {
-    if ($null -ne $probe) { $probe.Dispose() }
     if ($null -ne $guard) {
         try { $guard.Dispose(); Write-Log '已還原本次更動的桌寵視窗樣式。' }
         catch { Write-Log '視窗樣式還原失敗；請完整退出 Wuwa Tappo 再開啟。' }
     }
+    if ($null -ne $probe) {
+        $probe.Dispose()
+        foreach ($entry in $probe.GetEvents()) { Write-Log ('焦點軌跡：' + $entry) }
+    }
+    try { Stop-Transcript | Out-Null } catch { }
     if ($ownsMutex -and $null -ne $mutex) { $mutex.ReleaseMutex() }
     if ($null -ne $mutex) { $mutex.Dispose() }
 }
