@@ -1,4 +1,4 @@
-﻿# Wuwa Tappo automatic background chest collection v1.1.1
+﻿# Wuwa Tappo automatic background chest collection v1.1.2
 [CmdletBinding()]
 param([switch]$Auto, [ValidateSet('UpperFirst','LowerFirst')][string]$Order = 'UpperFirst')
 $ErrorActionPreference = 'Stop'
@@ -141,7 +141,7 @@ try {
     $mutex = New-Object System.Threading.Mutex($false, 'Local\WuwaTappoUIAAutoChestV1')
     $ownsMutex = $mutex.WaitOne(0)
     if (-not $ownsMutex) { throw '已有自動領取腳本執行中，請先關閉。' }
-    Write-Log ('Wuwa Tappo v1.1.1 背景領取；順序={0}；每 5 秒檢查。' -f $Order)
+    Write-Log ('Wuwa Tappo v1.1.2 背景領取；順序={0}；每 5 秒檢查。' -f $Order)
     Write-Log '先關閉表情／設定面板，等兩個寶箱都能領取。辨識完成後會自動背景領取。'
     $attempt = 0
     $batchClicks = 0
@@ -252,23 +252,52 @@ try {
             $remaining = @($current | Where-Object { (Get-ElementKey $_) -eq $button.Key })
             if ($remaining.Count -eq 0) { $gone = $true; break }
         }
-        # Keep the original short confirmation + polling delay, without restoring
-        # between the two confirmed, distinct chest controls.
+        # Allow transient WebView changes to settle while retaining the same guard.
         if ($gone -and -not $probe.TargetSeen -and $Auto -and $batchClicks -eq 1) {
-            $currentSnapshots = @(Get-Buttons $window | ForEach-Object { Get-ButtonSnapshot $_ })
-            $remainingReady = @(Get-ChestCandidates $calibration $currentSnapshots | Where-Object { $_.Enabled -and $_.Key -ne $button.Key })
-            if ((Test-ChestCalibration $calibration $currentSnapshots $key) -and $remainingReady.Count -eq 1) {
-                $nextChestKey = $remainingReady[0].Key
-                Write-Log ('第 {0} 次：按鈕已消失；保留防啟用樣式，約 7 秒後重新確認並領下一顆。' -f $attempt)
-                $probe.Mark('between-chests-guarded')
-                $betweenUntil = (Get-Date).AddSeconds(7)
-                while ((Get-Date) -lt $betweenUntil) {
-                    $guard.Verify()
-                    if ($probe.TargetSeen) { throw '兩顆之間觀察到桌寵進入前景，已停止。' }
-                    Start-Sleep -Milliseconds 250
+            Write-Log '第一顆已消失；保留防啟用樣式，最多 60 秒持續重查另一顆。'
+            $probe.Mark('retry-second-guarded')
+            $retryClock = [System.Diagnostics.Stopwatch]::StartNew()
+            $retryState = ''
+            $nextChestKey = $null
+            while ($retryClock.Elapsed.TotalSeconds -lt 60) {
+                $guard.Verify()
+                if ($probe.TargetSeen -or [WuwaBackgroundNative]::IsTargetForeground($target)) {
+                    throw '等待另一顆時桌寵進入前景，停止本輪並還原。'
                 }
+                $scanWindow = Get-GameWindow
+                $scanKey = '{0}:{1}' -f $scanWindow.Current.ProcessId, $scanWindow.Current.NativeWindowHandle
+                if ($scanKey -ne $key) { throw '等待另一顆時桌寵視窗已更換，停止本輪並還原。' }
+                $currentSnapshots = @(Get-Buttons $scanWindow | ForEach-Object { Get-ButtonSnapshot $_ })
+                $valid = Test-ChestCalibration $calibration $currentSnapshots $scanKey
+                $allMatches = @(Get-ChestCandidates $calibration $currentSnapshots)
+                $remainingReady = @($allMatches | Where-Object { $_.Enabled -and $_.Key -ne $button.Key })
+                $oldStillPresent = @($currentSnapshots | Where-Object { $_.Key -eq $button.Key }).Count -gt 0
+                $reason = '等待另一顆出現或啟用'
+                if (-not $valid) { $reason = '設定按鈕身分／尺寸或可見狀態未通過辨識' }
+                elseif ($oldStillPresent) { $reason = '剛領取的按鈕再次出現，等待介面穩定' }
+                elseif ($allMatches.Count -gt 2 -or $remainingReady.Count -gt 1) { $reason = '有多個候選，無法唯一確認另一顆' }
+                elseif ($remainingReady.Count -eq 1) { $reason = '已找到唯一可用的另一顆' }
+                $details = @($currentSnapshots | ForEach-Object {
+                    'id={0},size={1}x{2},visible={3},enabled={4},settings={5},previous={6}' -f $_.Key,$_.Width,$_.Height,$_.Visible,$_.Enabled,($_.Key -eq $calibration.SettingsKey),($_.Key -eq $button.Key)
+                }) -join ' | '
+                $state = '校準={0};總按鈕={1};尺寸候選={2};另一顆可用={3};原因={4}; {5}' -f $valid,$currentSnapshots.Count,$allMatches.Count,$remainingReady.Count,$reason,$details
+                if ($state -ne $retryState) {
+                    Write-Log ('重查（{0:N1} 秒）：{1}' -f $retryClock.Elapsed.TotalSeconds,$state)
+                    $retryState = $state
+                }
+                # Match the previous B short interval, but validate at the end of
+                # the wait rather than trusting a single immediate snapshot.
+                if ($valid -and -not $oldStillPresent -and $allMatches.Count -le 2 -and $remainingReady.Count -eq 1 -and $previousDispatchClock.Elapsed.TotalSeconds -ge 7) {
+                    $nextChestKey = $remainingReady[0].Key
+                    break
+                }
+                Start-Sleep -Milliseconds 250
+            }
+            if ($null -ne $nextChestKey) {
+                Write-Log ('另一顆已確認，接續領取；距前次送出 {0:N1} 秒。' -f $previousDispatchClock.Elapsed.TotalSeconds)
                 continue
             }
+            Write-Log '重查滿 60 秒仍無法唯一確認另一顆；本輪結束。'
         }
         $nextChestKey = $null
         $probe.Mark('guarded-wait')
