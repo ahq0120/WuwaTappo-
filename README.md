@@ -1,4 +1,4 @@
-# Wuwa Tappo 自動領寶箱 v1.1.2
+# Wuwa Tappo 自動領寶箱 v1.1.3
 
 1. 點選 **Code → Download ZIP**，下載後完整解壓縮。
 2. 開啟 Wuwa Tappo 並登入，讓桌寵顯示在桌面。
@@ -16,4 +16,4 @@
 
 若執行視窗被滑鼠選取後停住，按 Esc 解除選取，並在視窗內容中關閉「快速編輯模式」。
 
-若需回報問題，請附上同資料夾產生的 `wuwa-live-日期時間.log`；其中會記錄領取過程及前景程式名稱。若出現 `Cannot update Wuwa window style`，可對 `start.bat` 按右鍵，選「以系統管理員身分執行」後重試。
+若需回報問題，請附上同資料夾產生的 `wuwa-live.log`；每次啟動會覆蓋上一份，只保留最新一次執行紀錄，其中會記錄領取過程及前景程式名稱。舊版留下的日期時間 log 可自行刪除。若出現 `Cannot update Wuwa window style`，可對 `start.bat` 按右鍵，選「以系統管理員身分執行」後重試。

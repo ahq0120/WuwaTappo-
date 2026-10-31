@@ -1,4 +1,4 @@
-﻿# Wuwa Tappo automatic background chest collection v1.1.2
+﻿# Wuwa Tappo automatic background chest collection v1.1.3
 [CmdletBinding()]
 param([switch]$Auto, [ValidateSet('UpperFirst','LowerFirst')][string]$Order = 'UpperFirst')
 $ErrorActionPreference = 'Stop'
@@ -133,15 +133,18 @@ $mutex = $null
 $ownsMutex = $false
 $guard = $null
 $probe = $null
+$transcriptStarted = $false
 try {
-    Start-Transcript -Path (Join-Path $PSScriptRoot ('wuwa-live-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))) | Out-Null
     Add-Type -AssemblyName UIAutomationClient
     Add-Type -AssemblyName UIAutomationTypes
     Add-Type -Path (Join-Path $PSScriptRoot 'NativeBackground.cs')
     $mutex = New-Object System.Threading.Mutex($false, 'Local\WuwaTappoUIAAutoChestV1')
     $ownsMutex = $mutex.WaitOne(0)
     if (-not $ownsMutex) { throw '已有自動領取腳本執行中，請先關閉。' }
-    Write-Log ('Wuwa Tappo v1.1.2 背景領取；順序={0}；每 5 秒檢查。' -f $Order)
+    # Acquire the mutex before overwriting the current run's log.
+    Start-Transcript -Path (Join-Path $PSScriptRoot 'wuwa-live.log') -Force | Out-Null
+    $transcriptStarted = $true
+    Write-Log ('Wuwa Tappo v1.1.3 背景領取；順序={0}；每 5 秒檢查。' -f $Order)
     Write-Log '先關閉表情／設定面板，等兩個寶箱都能領取。辨識完成後會自動背景領取。'
     $attempt = 0
     $batchClicks = 0
@@ -341,7 +344,7 @@ try {
         $probe.Dispose()
         foreach ($entry in $probe.GetEvents()) { Write-Log ('焦點軌跡：' + $entry) }
     }
-    try { Stop-Transcript | Out-Null } catch { }
+    if ($transcriptStarted) { try { Stop-Transcript | Out-Null } catch { } }
     if ($ownsMutex -and $null -ne $mutex) { $mutex.ReleaseMutex() }
     if ($null -ne $mutex) { $mutex.Dispose() }
 }
