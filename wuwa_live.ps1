@@ -1,4 +1,4 @@
-﻿# Wuwa Tappo automatic background chest collection v1.1.3
+﻿# Wuwa Tappo automatic background chest collection v1.1.4
 [CmdletBinding()]
 param([switch]$Auto, [ValidateSet('UpperFirst','LowerFirst')][string]$Order = 'UpperFirst')
 $ErrorActionPreference = 'Stop'
@@ -129,6 +129,25 @@ function Update-MenuPause($State, $Pending, [bool]$ShouldPause, [datetime]$Now) 
 }
 
 
+function Wait-ForBackground([IntPtr]$Target, [ref]$Guard, $Probe) {
+    $seen = $null -ne $Probe -and $Probe.TargetSeen
+    if (-not $seen -and -not [WuwaBackgroundNative]::IsTargetForeground($Target)) { return [timespan]::Zero }
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-Log '桌寵取得焦點，暫停點擊；切回其他程式後自動恢復。'
+    $hadGuard = $null -ne $Guard.Value
+    if ($hadGuard) { $Guard.Value.Dispose(); $Guard.Value = $null }
+    while ([WuwaBackgroundNative]::IsTargetForeground($Target)) {
+        if (-not [WuwaBackgroundNative]::IsWindow($Target)) { throw '暫停期間桌寵視窗已關閉。' }
+        Start-Sleep -Milliseconds 250
+    }
+    if (-not [WuwaBackgroundNative]::IsWindow($Target)) { throw '暫停期間桌寵視窗已關閉。' }
+    if ($null -ne $Probe) { $Probe.ResetTargetSeen() }
+    if ($hadGuard) { $Guard.Value = New-Object WuwaBackgroundNative+WindowGuard($Target) }
+    Write-Log '已恢復自動領取；先重新確認已送出寶箱的狀態，不重複點擊。'
+    return $clock.Elapsed
+}
+
+
 $mutex = $null
 $ownsMutex = $false
 $guard = $null
@@ -144,7 +163,7 @@ try {
     # Acquire the mutex before overwriting the current run's log.
     Start-Transcript -Path (Join-Path $PSScriptRoot 'wuwa-live.log') -Force | Out-Null
     $transcriptStarted = $true
-    Write-Log ('Wuwa Tappo v1.1.3 背景領取；順序={0}；每 5 秒檢查。' -f $Order)
+    Write-Log ('Wuwa Tappo v1.1.4 背景領取；順序={0}；每 5 秒檢查。' -f $Order)
     Write-Log '先關閉表情／設定面板，等兩個寶箱都能領取。辨識完成後會自動背景領取。'
     $attempt = 0
     $batchClicks = 0
@@ -170,7 +189,7 @@ try {
         $buttons = @(Get-Buttons $window | ForEach-Object { Get-ButtonSnapshot $_ })
         if ($null -ne $guard) {
             $guard.Verify()
-            if ($probe.TargetSeen) { throw '兩顆之間觀察到桌寵進入前景，停止本輪。' }
+            $null = Wait-ForBackground $target ([ref]$guard) $probe
             if (-not (Test-ChestCalibration $calibration $buttons $key)) { throw '兩顆之間視窗或尺寸改變，停止本輪並還原。' }
         }
         if (-not (Test-ChestCalibration $calibration $buttons $key)) {
@@ -184,7 +203,7 @@ try {
             Write-Log '已重新辨識寶箱尺寸。'
         }
         $candidates = @(Get-ChestCandidates $calibration $buttons)
-        if ($null -ne $guard -and ($candidates.Count -gt 2 -or [WuwaBackgroundNative]::IsTargetForeground($target))) { throw '兩顆之間辨識條件改變或桌寵進入前景，停止本輪並還原。' }
+        if ($null -ne $guard -and $candidates.Count -gt 2) { throw '兩顆之間辨識條件改變，停止本輪並還原。' }
         if ($candidates.Count -gt 2) {
             if ($lastState -ne 'ambiguous') { Write-Log '符合尺寸的按鈕太多，暫停；條件恢復後自動繼續。'; $lastState = 'ambiguous' }
             Start-Sleep -Seconds 5
@@ -243,20 +262,32 @@ try {
         if (-not $position) { $position = '位置未知' }
         Write-Log ('第 {0} 次送出；寶箱={1}；螢幕座標={2},{3}。' -f $attempt, $position, $x, $y)
         $previousDispatchClock = [System.Diagnostics.Stopwatch]::StartNew()
-        $description = [WuwaBackgroundNative]::ClickWebView($target, $x, $y)
+        # A foreground race before dispatch returns null: no message was sent.
+        do {
+            $null = Wait-ForBackground $target ([ref]$guard) $probe
+            $fresh = Get-ButtonSnapshot $button.Element
+            if ($fresh.Key -ne $button.Key -or -not $fresh.Enabled -or -not (Test-DesktopButton $fresh) -or -not (Test-SameSize $fresh $calibration)) {
+                throw '恢復後寶箱狀態改變，未重新送出操作；請確認桌寵狀態。'
+            }
+            $r = $button.Element.Current.BoundingRectangle
+            $x = [int][Math]::Floor($r.Left + $r.Width / 2)
+            $y = [int][Math]::Floor($r.Top + $r.Height / 2)
+            $description = [WuwaBackgroundNative]::ClickWebView($target, $x, $y)
+        } while ($null -eq $description)
         Write-Log ('送出成功：' + $description + '（送出不等於已領取）')
         $gone = $false
         $until = (Get-Date).AddSeconds(10)
         while ((Get-Date) -lt $until) {
             Start-Sleep -Milliseconds 250
             $guard.Verify()
-            if ($probe.TargetSeen) { break }
+            $pausedFor = Wait-ForBackground $target ([ref]$guard) $probe
+            $until = $until.Add($pausedFor)
             $current = @(Get-Buttons $window)
             $remaining = @($current | Where-Object { (Get-ElementKey $_) -eq $button.Key })
             if ($remaining.Count -eq 0) { $gone = $true; break }
         }
         # Allow transient WebView changes to settle while retaining the same guard.
-        if ($gone -and -not $probe.TargetSeen -and $Auto -and $batchClicks -eq 1) {
+        if ($gone -and $Auto -and $batchClicks -eq 1) {
             Write-Log '第一顆已消失；保留防啟用樣式，最多 60 秒持續重查另一顆。'
             $probe.Mark('retry-second-guarded')
             $retryClock = [System.Diagnostics.Stopwatch]::StartNew()
@@ -264,9 +295,9 @@ try {
             $nextChestKey = $null
             while ($retryClock.Elapsed.TotalSeconds -lt 60) {
                 $guard.Verify()
-                if ($probe.TargetSeen -or [WuwaBackgroundNative]::IsTargetForeground($target)) {
-                    throw '等待另一顆時桌寵進入前景，停止本輪並還原。'
-                }
+                $retryClock.Stop()
+                $null = Wait-ForBackground $target ([ref]$guard) $probe
+                $retryClock.Start()
                 $scanWindow = Get-GameWindow
                 $scanKey = '{0}:{1}' -f $scanWindow.Current.ProcessId, $scanWindow.Current.NativeWindowHandle
                 if ($scanKey -ne $key) { throw '等待另一顆時桌寵視窗已更換，停止本輪並還原。' }
@@ -308,6 +339,8 @@ try {
         $holdUntil = (Get-Date).AddSeconds(15)
         while ((Get-Date) -lt $holdUntil) {
             $guard.Verify()
+            $pausedFor = Wait-ForBackground $target ([ref]$guard) $probe
+            $holdUntil = $holdUntil.Add($pausedFor)
             Start-Sleep -Milliseconds 250
         }
         $beforeRestoreSeen = $probe.TargetSeen
@@ -325,7 +358,10 @@ try {
         foreach ($entry in $probe.GetEvents()) { Write-Log ('焦點軌跡：' + $entry) }
         $probe = $null
         Write-Log ('第 {0} 次結果；寶箱={1}；按鈕消失={2}；桌寵進入前景={3}；前景變更={4}；還原後新增變更={5}。' -f $attempt, $position, $gone, $stolen, $changes, ($changes - $beforeRestoreChanges))
-        if ($stolen) { throw '觀察到桌寵進入前景，已停止。' }
+        if ($stolen) {
+            Write-Log '本輪曾偵測桌寵取得焦點，進入暫停／恢復檢查。'
+            $null = Wait-ForBackground $target ([ref]$guard) $null
+        }
         if (-not $gone) { throw '10 秒內沒看到寶箱按鈕消失。此法可能不被 WebView 接受；不重送、不改用舊版點擊。' }
         Write-Log '寶箱按鈕已消失，繼續等待下一次領取。'
         if (-not $Auto) { break }

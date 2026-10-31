@@ -90,6 +90,7 @@ public static class WuwaBackgroundNative {
         }
         public int Changes { get { return Volatile.Read(ref changes); } }
         public bool TargetSeen { get { return Volatile.Read(ref targetSeen) != 0; } }
+        public void ResetTargetSeen() { Interlocked.Exchange(ref targetSeen, 0); }
         public FocusProbe(IntPtr window) {
             target = window; process = ProcessOf(window); initial = GetForegroundWindow();
             Record(initial);
@@ -120,7 +121,7 @@ public static class WuwaBackgroundNative {
     }
     public static string ClickWebView(IntPtr root, int screenX, int screenY) {
         if (!IsWindow(root)) throw new InvalidOperationException("Wuwa window disappeared");
-        if (IsTargetForeground(root)) throw new InvalidOperationException("Switch to another application first");
+        if (IsTargetForeground(root)) return null;
         if ((Style(root) & NoActivate) == 0) throw new InvalidOperationException("No-activation guard is not active");
         IntPtr oldDpi = SetThreadDpiAwarenessContext(new IntPtr(-4));
         try {
@@ -143,7 +144,7 @@ public static class WuwaBackgroundNative {
             var point = new POINT { X = screenX, Y = screenY }; RECT client;
             if (!ScreenToClient(target, ref point) || !GetClientRect(target, out client) || point.X < 0 || point.Y < 0 || point.X >= client.Right || point.Y >= client.Bottom) throw new InvalidOperationException("Chest point outside WebView client area");
             IntPtr pos = PackClientPoint(point.X, point.Y);
-            if (IsTargetForeground(root)) throw new InvalidOperationException("Wuwa became foreground before dispatch");
+            if (IsTargetForeground(root)) return null;
             // No WM_MOUSEACTIVATE, focus/activation APIs, cursor movement, or input broadcast.
             uint owner = ProcessOf(root);
             CheckedPost(root, target, owner, 0x0200, UIntPtr.Zero, pos);
