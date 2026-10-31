@@ -1,4 +1,4 @@
-﻿# Wuwa Tappo automatic background chest collection v1.1.4
+﻿# Wuwa Tappo automatic background chest collection v1.1.5
 [CmdletBinding()]
 param([switch]$Auto, [ValidateSet('UpperFirst','LowerFirst')][string]$Order = 'UpperFirst')
 $ErrorActionPreference = 'Stop'
@@ -7,7 +7,7 @@ function Write-Log([string]$Message) {
 }
 function Get-GameWindow {
     $procs = @(Get-Process -Name WuwaTappo -ErrorAction SilentlyContinue)
-    if ($procs.Count -eq 0) { throw '請先開啟 Wuwa Tappo，並讓桌寵顯示在桌面。' }
+    if ($procs.Count -eq 0) { throw [System.InvalidOperationException]::new('WUWA_WINDOW_UNAVAILABLE: 桌寵尚未開啟。') }
     $found = @()
     foreach ($proc in $procs) {
         $condition = New-Object System.Windows.Automation.PropertyCondition(
@@ -18,7 +18,7 @@ function Get-GameWindow {
             if ($window.Current.Name -eq 'Wuwa Tappo') { $found += $window }
         }
     }
-    if ($found.Count -ne 1) { throw '找不到唯一的 Wuwa Tappo 桌寵視窗；請關閉其他同名程式後重試。' }
+    if ($found.Count -ne 1) { throw [System.InvalidOperationException]::new(('WUWA_WINDOW_UNAVAILABLE: 找到 {0} 個桌寵視窗，等待唯一視窗。' -f $found.Count)) }
     return $found[0]
 }
 function Get-Buttons($Window) {
@@ -163,19 +163,40 @@ try {
     # Acquire the mutex before overwriting the current run's log.
     Start-Transcript -Path (Join-Path $PSScriptRoot 'wuwa-live.log') -Force | Out-Null
     $transcriptStarted = $true
-    Write-Log ('Wuwa Tappo v1.1.4 背景領取；順序={0}；每 5 秒檢查。' -f $Order)
+    Write-Log ('Wuwa Tappo v1.1.5 背景領取；順序={0}；每 5 秒檢查。' -f $Order)
     Write-Log '先關閉表情／設定面板，等兩個寶箱都能領取。辨識完成後會自動背景領取。'
+    $uncertainDispatch = $false
+    $clearObservations = 0
+    $lastState = ''
+    $recoveryCalibration = $null
+    :WindowSession while ($true) {
+    try {
     $attempt = 0
     $batchClicks = 0
     $nextChestKey = $null
     $previousDispatchClock = $null
     $positionLabels = @{}
     $calibration = $null
-    $lastState = ''
+    if ($lastState -ne 'window-wait') { $lastState = '' }
     while ($null -eq $calibration) {
         $window = Get-GameWindow
         $windowKey = '{0}:{1}' -f $window.Current.ProcessId, $window.Current.NativeWindowHandle
         $buttons = @(Get-Buttons $window | ForEach-Object { Get-ButtonSnapshot $_ })
+        if ($uncertainDispatch) {
+            # Do not retry an unconfirmed dispatch after losing its UIA identity.
+            $pending = @(Get-ChestCandidates $recoveryCalibration $buttons | Where-Object { $_.Enabled })
+            $settingsVisible = @($buttons | Where-Object { (Test-DesktopButton $_) -and [Math]::Abs($_.Width - $recoveryCalibration.SettingsWidth) -le 1 -and [Math]::Abs($_.Height - $recoveryCalibration.SettingsHeight) -le 1 }).Count -eq 1
+            if ($pending.Count -gt 0 -or -not $settingsVisible) {
+                $clearObservations = 0
+                if ($lastState -ne 'pending') { Write-Log '中斷前可能已送出領取；等待寶箱離開可領取狀態，避免重送。'; $lastState = 'pending' }
+                Start-Sleep -Seconds 5
+                continue
+            }
+            $clearObservations++
+            if ($clearObservations -lt 3) { Start-Sleep -Seconds 5; continue }
+            $uncertainDispatch = $false
+            Write-Log '已觀察到寶箱離開可領取狀態；等待重新辨識。'
+        }
         $calibration = Find-ChestCalibration $buttons $windowKey
         $state = '目前按鈕 {0} 顆；等待唯一的同尺寸寶箱配對。' -f $buttons.Count
         if ($state -ne $lastState) { Write-Log $state; $lastState = $state }
@@ -188,6 +209,7 @@ try {
         $key = '{0}:{1}' -f $window.Current.ProcessId, $window.Current.NativeWindowHandle
         $buttons = @(Get-Buttons $window | ForEach-Object { Get-ButtonSnapshot $_ })
         if ($null -ne $guard) {
+            if ($key -ne $calibration.WindowKey) { throw 'WUWA_WINDOW_UNAVAILABLE: 桌寵視窗已更換。' }
             $guard.Verify()
             $null = Wait-ForBackground $target ([ref]$guard) $probe
             if (-not (Test-ChestCalibration $calibration $buttons $key)) { throw '兩顆之間視窗或尺寸改變，停止本輪並還原。' }
@@ -272,7 +294,9 @@ try {
             $r = $button.Element.Current.BoundingRectangle
             $x = [int][Math]::Floor($r.Left + $r.Width / 2)
             $y = [int][Math]::Floor($r.Top + $r.Height / 2)
+            $uncertainDispatch = $true
             $description = [WuwaBackgroundNative]::ClickWebView($target, $x, $y)
+            if ($null -eq $description) { $uncertainDispatch = $false }
         } while ($null -eq $description)
         Write-Log ('送出成功：' + $description + '（送出不等於已領取）')
         $gone = $false
@@ -284,7 +308,7 @@ try {
             $until = $until.Add($pausedFor)
             $current = @(Get-Buttons $window)
             $remaining = @($current | Where-Object { (Get-ElementKey $_) -eq $button.Key })
-            if ($remaining.Count -eq 0) { $gone = $true; break }
+            if ($remaining.Count -eq 0) { $gone = $true; $uncertainDispatch = $false; break }
         }
         # Allow transient WebView changes to settle while retaining the same guard.
         if ($gone -and $Auto -and $batchClicks -eq 1) {
@@ -300,7 +324,7 @@ try {
                 $retryClock.Start()
                 $scanWindow = Get-GameWindow
                 $scanKey = '{0}:{1}' -f $scanWindow.Current.ProcessId, $scanWindow.Current.NativeWindowHandle
-                if ($scanKey -ne $key) { throw '等待另一顆時桌寵視窗已更換，停止本輪並還原。' }
+                if ($scanKey -ne $key) { throw 'WUWA_WINDOW_UNAVAILABLE: 等待另一顆時桌寵視窗已更換。' }
                 $currentSnapshots = @(Get-Buttons $scanWindow | ForEach-Object { Get-ButtonSnapshot $_ })
                 $valid = Test-ChestCalibration $calibration $currentSnapshots $scanKey
                 $allMatches = @(Get-ChestCandidates $calibration $currentSnapshots)
@@ -366,6 +390,32 @@ try {
         Write-Log '寶箱按鈕已消失，繼續等待下一次領取。'
         if (-not $Auto) { break }
         Start-Sleep -Seconds 5
+    }
+    break WindowSession
+    } catch {
+        $windowFailure = $_.Exception.Message -like '*WUWA_WINDOW_UNAVAILABLE:*'
+        $exception = $_.Exception
+        while ($null -ne $exception) {
+            if ($exception.GetType().FullName -eq 'System.Windows.Automation.ElementNotAvailableException') { $windowFailure = $true }
+            $exception = $exception.InnerException
+        }
+        if (-not $windowFailure -and $null -ne $target -and $target -ne [IntPtr]::Zero) {
+            $windowFailure = -not [WuwaBackgroundNative]::IsWindow($target)
+        }
+        if (-not $Auto -or -not $windowFailure) { throw }
+        if ($null -ne $calibration) { $recoveryCalibration = $calibration }
+        if ($null -ne $guard) { try { $guard.Dispose() } catch { }; $guard = $null }
+        if ($null -ne $probe) {
+            $probe.Dispose()
+            foreach ($entry in $probe.GetEvents()) { Write-Log ('焦點軌跡：' + $entry) }
+            $probe = $null
+        }
+        if ($lastState -ne 'window-wait') { Write-Log '桌寵視窗暫時不存在或不唯一，暫停點擊；每 5 秒重新尋找，找到後重新辨識。' }
+        $lastState = 'window-wait'
+        $target = [IntPtr]::Zero
+        Start-Sleep -Seconds 5
+        continue WindowSession
+    }
     }
 } catch {
     Write-Log ('已停止：' + $_.Exception.Message)
