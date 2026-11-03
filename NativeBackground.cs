@@ -31,7 +31,30 @@ public static class WuwaBackgroundNative {
     [DllImport("kernel32.dll")] static extern void SetLastError(uint error);
     [DllImport("user32.dll", SetLastError=true)] static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll", SetLastError=true)] static extern bool PostMessageW(IntPtr window, uint message, UIntPtr wParam, IntPtr lParam);
-    [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+    [DllImport("user32.dll", SetLastError=true)] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+
+    // Establish physical coordinates BEFORE any UI Automation reads, not just dispatch.
+    // Scope applies only to this script thread; it never changes Wuwa's DPI settings.
+    public sealed class PhysicalCoordinates : IDisposable {
+        readonly IntPtr previous;
+        readonly int ownerThread;
+        bool disposed;
+        public PhysicalCoordinates() {
+            ownerThread = Thread.CurrentThread.ManagedThreadId;
+            previous = SetThreadDpiAwarenessContext(new IntPtr(-4));
+            if (previous == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot enable per-monitor physical coordinates; no click sent");
+        }
+        public void Dispose() {
+            if (disposed) return;
+            if (Thread.CurrentThread.ManagedThreadId != ownerThread) throw new InvalidOperationException("DPI scope must be restored on its original thread");
+            if (SetThreadDpiAwarenessContext(previous) == IntPtr.Zero) throw new InvalidOperationException("Cannot restore script DPI context");
+            disposed = true;
+        }
+    }
+    public static bool ContainsPhysicalPoint(RECT r, int x, int y) {
+        return r.Right > r.Left && r.Bottom > r.Top && x >= r.Left && x < r.Right && y >= r.Top && y < r.Bottom;
+    }
+    static string DescribeRect(RECT r) { return r.Left + "," + r.Top + ".." + r.Right + "," + r.Bottom; }
 
     static long Style(IntPtr window) { return IntPtr.Size == 8 ? GetLong64(window, ExStyle).ToInt64() : GetLong32(window, ExStyle); }
     static void SetStyle(IntPtr window, long style) {
@@ -123,14 +146,17 @@ public static class WuwaBackgroundNative {
         if (!IsWindow(root)) throw new InvalidOperationException("Wuwa window disappeared");
         if (IsTargetForeground(root)) return null;
         if ((Style(root) & NoActivate) == 0) throw new InvalidOperationException("No-activation guard is not active");
-        IntPtr oldDpi = SetThreadDpiAwarenessContext(new IntPtr(-4));
-        try {
+        using (var dpi = new PhysicalCoordinates()) {
             var matches = new List<IntPtr>(); long smallest = long.MaxValue;
+            var geometry = new StringBuilder();
             EnumProc callback = delegate(IntPtr child, IntPtr ignored) {
                 var name = new StringBuilder(256); GetClassName(child, name, name.Capacity);
-                if (name.ToString() != "Chrome_RenderWidgetHostHWND" || !IsWindowVisible(child)) return true;
+                if (name.ToString() != "Chrome_RenderWidgetHostHWND") return true;
                 RECT r;
-                if (!GetWindowRect(child, out r) || screenX < r.Left || screenX >= r.Right || screenY < r.Top || screenY >= r.Bottom) return true;
+                bool visible = IsWindowVisible(child);
+                bool measured = GetWindowRect(child, out r);
+                geometry.Append(" hwnd=0x" + child.ToInt64().ToString("X") + "; visible=" + visible + "; measured=" + measured + "; rect=" + DescribeRect(r));
+                if (!visible || !measured || !ContainsPhysicalPoint(r, screenX, screenY)) return true;
                 long area = (long)(r.Right-r.Left) * (r.Bottom-r.Top);
                 if (area <= 0) return true;
                 if (area < smallest) { smallest = area; matches.Clear(); }
@@ -138,7 +164,7 @@ public static class WuwaBackgroundNative {
                 return true;
             };
             EnumChildWindows(root, callback, IntPtr.Zero);
-            if (matches.Count != 1) throw new InvalidOperationException("Cannot uniquely locate the WebView input window (count=" + matches.Count + ")");
+            if (matches.Count != 1) throw new InvalidOperationException("Cannot uniquely locate the WebView input window (count=" + matches.Count + "); physical point=" + screenX + "," + screenY + "; candidates:" + geometry);
             IntPtr target = matches[0];
             if (!IsChild(root, target) || GetAncestor(target, 2) != root) throw new InvalidOperationException("Input window is not inside Wuwa");
             var point = new POINT { X = screenX, Y = screenY }; RECT client;
@@ -152,6 +178,6 @@ public static class WuwaBackgroundNative {
             Thread.Sleep(60);
             CheckedPost(root, target, owner, 0x0202, UIntPtr.Zero, pos);
             return "Chrome_RenderWidgetHostHWND; client=" + point.X + "," + point.Y;
-        } finally { if (oldDpi != IntPtr.Zero) SetThreadDpiAwarenessContext(oldDpi); }
+        }
     }
 }

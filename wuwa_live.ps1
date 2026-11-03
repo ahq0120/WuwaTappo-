@@ -1,4 +1,4 @@
-﻿# Wuwa Tappo automatic background chest collection v1.1.5
+﻿# Wuwa Tappo automatic background chest collection v1.1.6
 [CmdletBinding()]
 param([switch]$Auto, [ValidateSet('UpperFirst','LowerFirst')][string]$Order = 'UpperFirst')
 $ErrorActionPreference = 'Stop'
@@ -153,17 +153,20 @@ $ownsMutex = $false
 $guard = $null
 $probe = $null
 $transcriptStarted = $false
+$dpiScope = $null
 try {
+    Add-Type -Path (Join-Path $PSScriptRoot 'NativeBackground.cs')
+    $dpiScope = New-Object WuwaBackgroundNative+PhysicalCoordinates
     Add-Type -AssemblyName UIAutomationClient
     Add-Type -AssemblyName UIAutomationTypes
-    Add-Type -Path (Join-Path $PSScriptRoot 'NativeBackground.cs')
     $mutex = New-Object System.Threading.Mutex($false, 'Local\WuwaTappoUIAAutoChestV1')
     $ownsMutex = $mutex.WaitOne(0)
     if (-not $ownsMutex) { throw '已有自動領取腳本執行中，請先關閉。' }
     # Acquire the mutex before overwriting the current run's log.
     Start-Transcript -Path (Join-Path $PSScriptRoot 'wuwa-live.log') -Force | Out-Null
     $transcriptStarted = $true
-    Write-Log ('Wuwa Tappo v1.1.5 背景領取；順序={0}；每 5 秒檢查。' -f $Order)
+    Write-Log '多螢幕模式：辨識與點擊統一使用 Per-Monitor V2 實體座標。'
+    Write-Log ('Wuwa Tappo v1.1.6 背景領取；順序={0}；每 5 秒檢查。' -f $Order)
     Write-Log '先關閉表情／設定面板，等兩個寶箱都能領取。辨識完成後會自動背景領取。'
     $uncertainDispatch = $false
     $clearObservations = 0
@@ -282,6 +285,8 @@ try {
         $attempt++
         $position = $positionLabels[$button.Key]
         if (-not $position) { $position = '位置未知' }
+        $windowRect = $window.Current.BoundingRectangle
+        Write-Log ('座標診斷：桌寵範圍={0},{1}；尺寸={2}x{3}；按鈕範圍={4},{5}；尺寸={6}x{7}。' -f $windowRect.Left,$windowRect.Top,$windowRect.Width,$windowRect.Height,$r.Left,$r.Top,$r.Width,$r.Height)
         Write-Log ('第 {0} 次送出；寶箱={1}；螢幕座標={2},{3}。' -f $attempt, $position, $x, $y)
         $previousDispatchClock = [System.Diagnostics.Stopwatch]::StartNew()
         # A foreground race before dispatch returns null: no message was sent.
@@ -430,6 +435,7 @@ try {
         $probe.Dispose()
         foreach ($entry in $probe.GetEvents()) { Write-Log ('焦點軌跡：' + $entry) }
     }
+    if ($null -ne $dpiScope) { try { $dpiScope.Dispose() } catch { Write-Log ('DPI 模式還原：' + $_.Exception.Message) } }
     if ($transcriptStarted) { try { Stop-Transcript | Out-Null } catch { } }
     if ($ownsMutex -and $null -ne $mutex) { $mutex.ReleaseMutex() }
     if ($null -ne $mutex) { $mutex.Dispose() }
